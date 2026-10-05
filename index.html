@@ -4968,34 +4968,85 @@ function setSyncIndicator(status) {
   }
 }
 
-// Fire-and-forget push: the caller has already saved locally, so a failure
-// here just means this device's copy is temporarily ahead of the shared Sheet.
-async function pushToRemote(key, valueString) {
-  setSyncIndicator("syncing");
-  try {
-    const res = await fetch(SYNC_API_URL, {
-      method: "POST",
-      // text/plain avoids a CORS preflight that Apps Script web apps don't handle;
-      // the body is still valid JSON and is parsed as such on the server.
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ key, value: valueString, secret: SYNC_SECRET }),
-    });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error);
-    setSyncIndicator("idle");
-  } catch (e) {
-    console.error("Push failed for " + key, e);
-    setSyncIndicator("error");
+/* ---- Sync engine v2 (PWA): request queue, retries, big-value chunking,
+   and "dirty" tracking so a failed upload is retried and never overwritten
+   by older data from the Sheet. ---- */
+const SYNC_MAX_PARALLEL = 3;          // Apps Script rejects too many requests at once
+const SYNC_CELL_LIMIT = 30000;        // Google Sheets cell limit is 50,000 chars
+const SYNC_DIRTY_KEY = "ht-sync-dirty-v2";
+let _syncActive = 0; const _syncWait = [];
+function _syncSlot() { return new Promise((ok) => { if (_syncActive < SYNC_MAX_PARALLEL) { _syncActive++; ok(); } else _syncWait.push(ok); }); }
+function _syncFree() { const n = _syncWait.shift(); if (n) n(); else _syncActive--; }
+async function gasCall(url, opts) {
+  let lastErr;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt) await new Promise((r) => setTimeout(r, 800 * Math.pow(2, attempt - 1)));
+    await _syncSlot();
+    try {
+      const res = await fetch(url, Object.assign({ redirect: "follow", cache: "no-store" }, opts || {}));
+      const txt = await res.text();
+      let data;
+      try { data = JSON.parse(txt); } catch (e) { throw new Error("Server busy / not JSON (HTTP " + res.status + ")"); }
+      if (data && data.error) throw new Error(data.error);
+      return data;
+    } catch (e) { lastErr = e; } finally { _syncFree(); }
   }
+  throw lastErr;
+}
+function syncDirty() { try { return JSON.parse(localStorage.getItem(SYNC_DIRTY_KEY) || "{}") || {}; } catch (e) { return {}; } }
+function markDirty(key, on) { const d = syncDirty(); if (on) d[key] = Date.now(); else delete d[key]; localStorage.setItem(SYNC_DIRTY_KEY, JSON.stringify(d)); }
+function gasPost(key, value) {
+  return gasCall(SYNC_API_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ key, value, secret: SYNC_SECRET }) });
+}
+const _keyChain = {};
+// Pushes of the same key run one after another, so an older save can never land after a newer one.
+function pushToRemote(key, valueString) {
+  markDirty(key, true);
+  const run = async () => {
+    const v = localStorage.getItem(key); const val = v != null ? v : valueString; // always send the newest local copy
+    setSyncIndicator("syncing");
+    try {
+      if (val.length <= SYNC_CELL_LIMIT) await gasPost(key, val);
+      else {
+        const parts = []; for (let i = 0; i < val.length; i += SYNC_CELL_LIMIT) parts.push(val.slice(i, i + SYNC_CELL_LIMIT));
+        for (let i = 0; i < parts.length; i++) await gasPost(key + ":" + i, parts[i]);
+        await gasPost(key, JSON.stringify({ __chunks: parts.length, t: Date.now() }));
+      }
+      markDirty(key, false);
+      setSyncIndicator("idle");
+    } catch (e) { console.error("Push failed for " + key, e); setSyncIndicator("error"); }
+  };
+  _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
+  return _keyChain[key];
 }
 
 async function pullOneFromRemote(key) {
   const url = `${SYNC_API_URL}?key=${encodeURIComponent(key)}&secret=${encodeURIComponent(SYNC_SECRET)}`;
-  const res = await fetch(url);
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
+  const data = await gasCall(url);
   return data.value; // string, or null if the key has never been saved remotely
 }
+// Reads a key that may have been split into chunks by pushToRemote.
+async function pullKeyFull(key) {
+  const v = await pullOneFromRemote(key);
+  if (typeof v === "string" && v.indexOf('{"__chunks":') === 0) {
+    const n = JSON.parse(v).__chunks;
+    const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i));
+    if (parts.some((p) => p == null)) throw new Error("incomplete");
+    return parts.join("");
+  }
+  return v;
+}
+// Re-sends anything that failed to upload earlier.
+async function flushDirty() {
+  const d = syncDirty(); const qByKey = {};
+  if (typeof QDATA_KEYS === "object") Object.keys(QDATA_KEYS).forEach((k) => { qByKey[QDATA_KEYS[k]] = k; });
+  for (const key of Object.keys(d)) {
+    if (qByKey[key]) await qPushRemote(qByKey[key]);
+    else if (localStorage.getItem(key) != null) await pushToRemote(key, localStorage.getItem(key));
+    else markDirty(key, false);
+  }
+}
+window.addEventListener("online", () => { flushDirty().catch(() => {}); });
 
 function reloadStateFromLocalStorage() {
   state.records = loadRecords();
@@ -5026,13 +5077,16 @@ async function pullAllFromRemote(showIndicator) {
     PROD_OVR_KEY, PROD_IMPORT_KEY, MASTER_OV_KEY,
   ];
   try {
-    const results = await Promise.all(keys.map((k) => pullOneFromRemote(k).catch(() => undefined)));
+    await flushDirty().catch(() => {});
+    const results = await Promise.all(keys.map((k) => pullKeyFull(k).catch(() => undefined)));
     let sawError = results.some((v) => v === undefined);
+    const dirty = syncDirty();
     keys.forEach((key, i) => {
       const val = results[i];
+      if (dirty[key]) { sawError = true; return; } // local change not uploaded yet: keep it
       if (val !== undefined && val !== null) localStorage.setItem(key, val);
     });
-    await Promise.all(Object.keys(QSPECS).map((k) => qPullRemote(k).catch(() => { sawError = true; })));
+    await Promise.all(Object.keys(QSPECS).map((k) => (dirty[QDATA_KEYS[k]] ? Promise.resolve() : qPullRemote(k)).catch(() => { sawError = true; })));
     reloadStateFromLocalStorage();
     setSyncIndicator(sawError ? "error" : "idle");
     renderMain();
@@ -7985,20 +8039,23 @@ function qSave(kind) {
   flashSaved();
   qPushRemote(kind);
 }
-async function qPost(key, value) {
-  const res = await fetch(SYNC_API_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ key, value, secret: SYNC_SECRET }) });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-}
-async function qPushRemote(kind) {
-  const key = QDATA_KEYS[kind], json = JSON.stringify(Q.data[kind]), parts = [];
-  for (let i = 0; i < json.length; i += Q_CHUNK) parts.push(json.slice(i, i + Q_CHUNK));
-  setSyncIndicator("syncing");
-  try {
-    for (let i = 0; i < parts.length; i++) await qPost(key + ":" + i, parts[i]);
-    await qPost(key, JSON.stringify({ n: parts.length, t: Date.now() }));
-    setSyncIndicator("idle");
-  } catch (e) { console.error("Push failed for " + key, e); setSyncIndicator("error"); }
+async function qPost(key, value) { await gasPost(key, value); }
+function qPushRemote(kind) {
+  const key = QDATA_KEYS[kind];
+  markDirty(key, true);
+  const run = async () => {
+    const json = JSON.stringify(Q.data[kind]), parts = [];
+    for (let i = 0; i < json.length; i += Q_CHUNK) parts.push(json.slice(i, i + Q_CHUNK));
+    setSyncIndicator("syncing");
+    try {
+      for (let i = 0; i < parts.length; i++) await qPost(key + ":" + i, parts[i]);
+      await qPost(key, JSON.stringify({ n: parts.length, t: Date.now() }));
+      markDirty(key, false);
+      setSyncIndicator("idle");
+    } catch (e) { console.error("Push failed for " + key, e); setSyncIndicator("error"); }
+  };
+  _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
+  return _keyChain[key];
 }
 async function qPullRemote(kind) {
   const key = QDATA_KEYS[kind];
@@ -8007,7 +8064,7 @@ async function qPullRemote(kind) {
   let n = 0;
   try { n = JSON.parse(head).n; } catch (e) { return; }
   if (!(n > 0)) return;
-  const parts = await Promise.all(Array.from({ length: n }, (_, i) => pullOneFromRemote(key + ":" + i)));
+  const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i));
   if (parts.some((p) => p == null)) throw new Error("incomplete");
   localStorage.setItem(key, parts.join(""));
 }
