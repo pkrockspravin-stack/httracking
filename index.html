@@ -4983,8 +4983,13 @@ async function gasCall(url, opts) {
     if (attempt) await new Promise((r) => setTimeout(r, 800 * Math.pow(2, attempt - 1)));
     await _syncSlot();
     try {
-      const res = await fetch(url, Object.assign({ redirect: "follow", cache: "no-store" }, opts || {}));
-      const txt = await res.text();
+      const ctl = typeof AbortController === "function" ? new AbortController() : null;
+      const tmr = ctl ? setTimeout(() => ctl.abort(), 30000) : null;
+      let res, txt;
+      try {
+        res = await fetch(url, Object.assign({ redirect: "follow", cache: "no-store" }, ctl ? { signal: ctl.signal } : {}, opts || {}));
+        txt = await res.text();
+      } finally { if (tmr) clearTimeout(tmr); }
       let data;
       try { data = JSON.parse(txt); } catch (e) { throw new Error("Server busy / not JSON (HTTP " + res.status + ")"); }
       if (data && data.error) throw new Error(data.error);
@@ -5020,7 +5025,9 @@ function pushToRemote(key, valueString) {
   return _keyChain[key];
 }
 
+let _pullCache = null; // filled by one bulk read during a full sync
 async function pullOneFromRemote(key) {
+  if (_pullCache) return Object.prototype.hasOwnProperty.call(_pullCache, key) ? _pullCache[key] : null;
   const url = `${SYNC_API_URL}?key=${encodeURIComponent(key)}&secret=${encodeURIComponent(SYNC_SECRET)}`;
   const data = await gasCall(url);
   return data.value; // string, or null if the key has never been saved remotely
@@ -5078,6 +5085,11 @@ async function pullAllFromRemote(showIndicator) {
   ];
   try {
     await flushDirty().catch(() => {});
+    // One request for everything (needs the updated Apps Script); falls back to one-by-one.
+    try {
+      const all = await gasCall(`${SYNC_API_URL}?all=1&secret=${encodeURIComponent(SYNC_SECRET)}`);
+      if (all && all.values && typeof all.values === "object") _pullCache = all.values;
+    } catch (e) { /* fall back */ }
     const results = await Promise.all(keys.map((k) => pullKeyFull(k).catch(() => undefined)));
     let sawError = results.some((v) => v === undefined);
     const dirty = syncDirty();
@@ -5087,10 +5099,12 @@ async function pullAllFromRemote(showIndicator) {
       if (val !== undefined && val !== null) localStorage.setItem(key, val);
     });
     await Promise.all(Object.keys(QSPECS).map((k) => (dirty[QDATA_KEYS[k]] ? Promise.resolve() : qPullRemote(k)).catch(() => { sawError = true; })));
+    _pullCache = null;
     reloadStateFromLocalStorage();
-    setSyncIndicator(sawError ? "error" : "idle");
     renderMain();
+    setSyncIndicator(sawError ? "error" : "idle");
   } catch (e) {
+    _pullCache = null;
     console.error("Pull failed", e);
     setSyncIndicator("error");
   }
