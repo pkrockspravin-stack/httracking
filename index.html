@@ -4977,9 +4977,9 @@ const SYNC_DIRTY_KEY = "ht-sync-dirty-v2";
 let _syncActive = 0; const _syncWait = [];
 function _syncSlot() { return new Promise((ok) => { if (_syncActive < SYNC_MAX_PARALLEL) { _syncActive++; ok(); } else _syncWait.push(ok); }); }
 function _syncFree() { const n = _syncWait.shift(); if (n) n(); else _syncActive--; }
-async function gasCall(url, opts) {
+async function gasCall(url, opts, tries) {
   let lastErr;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < (tries || 4); attempt++) {
     if (attempt) await new Promise((r) => setTimeout(r, 800 * Math.pow(2, attempt - 1)));
     await _syncSlot();
     try {
@@ -5087,9 +5087,16 @@ async function pullAllFromRemote(showIndicator) {
     await flushDirty().catch(() => {});
     // One request for everything (needs the updated Apps Script); falls back to one-by-one.
     try {
-      const all = await gasCall(`${SYNC_API_URL}?all=1&secret=${encodeURIComponent(SYNC_SECRET)}`);
-      if (all && all.values && typeof all.values === "object") _pullCache = all.values;
-    } catch (e) { /* fall back */ }
+      const merged = {}; let start = 1, pages = 0;
+      while (pages++ < 200) {
+        const d = await gasCall(`${SYNC_API_URL}?all=1&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, null, 2);
+        if (!d || !d.values || typeof d.values !== "object") throw new Error("no bulk");
+        Object.assign(merged, d.values);
+        if (d.next == null) break;
+        start = d.next;
+      }
+      _pullCache = merged;
+    } catch (e) { _pullCache = null; /* fall back to one-by-one */ }
     const results = await Promise.all(keys.map((k) => pullKeyFull(k).catch(() => undefined)));
     let sawError = results.some((v) => v === undefined);
     const dirty = syncDirty();
