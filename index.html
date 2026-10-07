@@ -5106,10 +5106,21 @@ function reloadStateFromLocalStorage() {
 let _pullRunning = null; // a Sync already in progress is joined, not started twice
 function pullAllFromRemote(showIndicator) {
   if (_pullRunning) { if (showIndicator) setSyncIndicator("pulling"); return _pullRunning; }
-  _pullRunning = _pullAllInner(showIndicator).finally(() => { _pullRunning = null; });
+  // Google Apps Script sometimes refuses a request when busy: retry by itself (after 5 s, then 15 s)
+  // before showing "sync failed".
+  _pullRunning = (async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt) {
+        setSyncIndicator("pulling", "(retrying " + attempt + " of 2)");
+        await new Promise((r) => setTimeout(r, attempt === 1 ? 5000 : 15000));
+      }
+      if (await _pullAllInner(showIndicator || attempt > 0, attempt < 2)) return true;
+    }
+    return false;
+  })().finally(() => { _pullRunning = null; });
   return _pullRunning;
 }
-async function _pullAllInner(showIndicator) {
+async function _pullAllInner(showIndicator, quietFail) {
   if (showIndicator) setSyncIndicator("pulling");
   const keys = [
     STORAGE_KEY, ENERGY_STORAGE_KEY, TWOHR_STORAGE_KEY, SHIFT_STORAGE_KEY,
@@ -5140,9 +5151,9 @@ async function _pullAllInner(showIndicator) {
       }
       _pullCache = merged; _pullPartial = partial;
     } catch (e) { _pullCache = null; _pullPartial = false; serverNow = null; }
-    if (bulkBroken) { // keep everything on this phone as it is; try again on the next Sync
-      setSyncIndicator("error");
-      return;
+    if (bulkBroken) { // keep everything on this phone as it is; try again
+      if (!quietFail) setSyncIndicator("error");
+      return false;
     }
     const has = (k) => !_pullPartial || Object.prototype.hasOwnProperty.call(_pullCache, k);
     const pullKeys = keys.filter(has); // unchanged keys are skipped
@@ -5160,11 +5171,13 @@ async function _pullAllInner(showIndicator) {
     if (!sawError && serverNow != null) localStorage.setItem(SYNC_SINCE_KEY, String(serverNow - 15000));
     reloadStateFromLocalStorage();
     renderMain();
-    setSyncIndicator(sawError ? "error" : "idle");
+    if (!sawError || !quietFail) setSyncIndicator(sawError ? "error" : "idle");
+    return !sawError;
   } catch (e) {
     _pullCache = null; _pullPartial = false;
     console.error("Pull failed", e);
-    setSyncIndicator("error");
+    if (!quietFail) setSyncIndicator("error");
+    return false;
   }
 }
 
