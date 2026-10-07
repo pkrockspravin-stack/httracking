@@ -5025,9 +5025,14 @@ function pushToRemote(key, valueString) {
   return _keyChain[key];
 }
 
-let _pullCache = null; // filled by one bulk read during a full sync
+let _pullCache = null;      // filled by the bulk read during a sync
+let _pullPartial = false;  // true when the bulk read held only changed keys
+const SYNC_SINCE_KEY = "ht-sync-since-v2";
 async function pullOneFromRemote(key) {
-  if (_pullCache) return Object.prototype.hasOwnProperty.call(_pullCache, key) ? _pullCache[key] : null;
+  if (_pullCache) {
+    if (Object.prototype.hasOwnProperty.call(_pullCache, key)) return _pullCache[key];
+    if (!_pullPartial) return null;
+  }
   const url = `${SYNC_API_URL}?key=${encodeURIComponent(key)}&secret=${encodeURIComponent(SYNC_SECRET)}`;
   const data = await gasCall(url);
   return data.value; // string, or null if the key has never been saved remotely
@@ -5086,32 +5091,40 @@ async function pullAllFromRemote(showIndicator) {
   try {
     await flushDirty().catch(() => {});
     // One request for everything (needs the updated Apps Script); falls back to one-by-one.
+    // Bulk read: only what changed since the last good sync (everything the first time).
+    let serverNow = null;
     try {
-      const merged = {}; let start = 1, pages = 0;
+      const since = Number(localStorage.getItem(SYNC_SINCE_KEY)) || 0;
+      const merged = {}; let start = 1, pages = 0, partial = false;
       while (pages++ < 200) {
-        const d = await gasCall(`${SYNC_API_URL}?all=1&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, null, 2);
+        const d = await gasCall(`${SYNC_API_URL}?all=1&since=${since}&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, null, 2);
         if (!d || !d.values || typeof d.values !== "object") throw new Error("no bulk");
+        if (pages === 1) { serverNow = typeof d.now === "number" ? d.now : null; partial = !!d.incremental && serverNow != null; }
         Object.assign(merged, d.values);
         if (d.next == null) break;
         start = d.next;
       }
-      _pullCache = merged;
-    } catch (e) { _pullCache = null; /* fall back to one-by-one */ }
-    const results = await Promise.all(keys.map((k) => pullKeyFull(k).catch(() => undefined)));
+      _pullCache = merged; _pullPartial = partial;
+    } catch (e) { _pullCache = null; _pullPartial = false; serverNow = null; /* fall back to one-by-one */ }
+    const has = (k) => !_pullPartial || Object.prototype.hasOwnProperty.call(_pullCache, k);
+    const pullKeys = keys.filter(has); // unchanged keys are skipped
+    const results = await Promise.all(pullKeys.map((k) => pullKeyFull(k).catch(() => undefined)));
     let sawError = results.some((v) => v === undefined);
     const dirty = syncDirty();
-    keys.forEach((key, i) => {
+    pullKeys.forEach((key, i) => {
       const val = results[i];
       if (dirty[key]) { sawError = true; return; } // local change not uploaded yet: keep it
       if (val !== undefined && val !== null) localStorage.setItem(key, val);
     });
-    await Promise.all(Object.keys(QSPECS).map((k) => (dirty[QDATA_KEYS[k]] ? Promise.resolve() : qPullRemote(k)).catch(() => { sawError = true; })));
-    _pullCache = null;
+    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => (dirty[QDATA_KEYS[k]] ? Promise.resolve() : qPullRemote(k)).catch(() => { sawError = true; })));
+    _pullCache = null; _pullPartial = false;
+    // Next sync asks only for changes after this one (15-second overlap for safety).
+    if (!sawError && serverNow != null) localStorage.setItem(SYNC_SINCE_KEY, String(serverNow - 15000));
     reloadStateFromLocalStorage();
     renderMain();
     setSyncIndicator(sawError ? "error" : "idle");
   } catch (e) {
-    _pullCache = null;
+    _pullCache = null; _pullPartial = false;
     console.error("Pull failed", e);
     setSyncIndicator("error");
   }
