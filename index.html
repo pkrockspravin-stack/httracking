@@ -4973,7 +4973,7 @@ function setSyncIndicator(status) {
    by older data from the Sheet. ---- */
 const SYNC_MAX_PARALLEL = 3;          // Apps Script rejects too many requests at once
 const SYNC_CELL_LIMIT = 45000;        // Google Sheets cell limit is 50,000 chars
-const SYNC_BATCH_BYTES = 1500000;     // up to ~1.5 MB of pieces per upload request
+const SYNC_BATCH_BYTES = 400000;      // up to ~400 KB of pieces per upload request
 const SYNC_DIRTY_KEY = "ht-sync-dirty-v2";
 let _syncActive = 0; const _syncWait = [];
 function _syncSlot() { return new Promise((ok) => { if (_syncActive < SYNC_MAX_PARALLEL) { _syncActive++; ok(); } else _syncWait.push(ok); }); }
@@ -4985,7 +4985,7 @@ async function gasCall(url, opts, tries) {
     await _syncSlot();
     try {
       const ctl = typeof AbortController === "function" ? new AbortController() : null;
-      const tmr = ctl ? setTimeout(() => ctl.abort(), 30000) : null;
+      const tmr = ctl ? setTimeout(() => ctl.abort(), (opts && opts.timeoutMs) || 30000) : null;
       let res, txt;
       try {
         res = await fetch(url, Object.assign({ redirect: "follow", cache: "no-store" }, ctl ? { signal: ctl.signal } : {}, opts || {}));
@@ -5014,10 +5014,9 @@ async function gasPostMany(items) {
     if (cur.length) groups.push(cur);
     let done = 0;
     for (const g of groups) {
-      let r = null;
-      try { r = await gasCall(SYNC_API_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ items: g, secret: SYNC_SECRET }) }, 2); }
-      catch (e) { if (done) throw e; } // first request failing may mean an older script: try the old way
-      if (!r || !r.batch) { _batchOk = false; break; }
+      // Big writes can take Google a while: allow 2 minutes, and never fall back to the slow way on a timeout.
+      const r = await gasCall(SYNC_API_URL, { method: "POST", timeoutMs: 120000, headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ items: g, secret: SYNC_SECRET }) }, 3);
+      if (!r || !r.batch) { _batchOk = false; break; } // older Apps Script: use one request per piece
       done += g.length;
     }
     if (_batchOk) return;
