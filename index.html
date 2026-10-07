@@ -4972,7 +4972,8 @@ function setSyncIndicator(status) {
    and "dirty" tracking so a failed upload is retried and never overwritten
    by older data from the Sheet. ---- */
 const SYNC_MAX_PARALLEL = 3;          // Apps Script rejects too many requests at once
-const SYNC_CELL_LIMIT = 30000;        // Google Sheets cell limit is 50,000 chars
+const SYNC_CELL_LIMIT = 45000;        // Google Sheets cell limit is 50,000 chars
+const SYNC_BATCH_BYTES = 1500000;     // up to ~1.5 MB of pieces per upload request
 const SYNC_DIRTY_KEY = "ht-sync-dirty-v2";
 let _syncActive = 0; const _syncWait = [];
 function _syncSlot() { return new Promise((ok) => { if (_syncActive < SYNC_MAX_PARALLEL) { _syncActive++; ok(); } else _syncWait.push(ok); }); }
@@ -5003,6 +5004,27 @@ function markDirty(key, on) { const d = syncDirty(); if (on) d[key] = Date.now()
 function gasPost(key, value) {
   return gasCall(SYNC_API_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ key, value, secret: SYNC_SECRET }) });
 }
+// Uploads many key/value pieces in as few requests as possible (needs the updated
+// Apps Script; with an older script it falls back to one request per piece).
+let _batchOk = true;
+async function gasPostMany(items) {
+  if (_batchOk) {
+    const groups = []; let cur = [], size = 0;
+    items.forEach((it) => { const l = it.value.length + it.key.length; if (cur.length && size + l > SYNC_BATCH_BYTES) { groups.push(cur); cur = []; size = 0; } cur.push(it); size += l; });
+    if (cur.length) groups.push(cur);
+    let done = 0;
+    for (const g of groups) {
+      let r = null;
+      try { r = await gasCall(SYNC_API_URL, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ items: g, secret: SYNC_SECRET }) }, 2); }
+      catch (e) { if (done) throw e; } // first request failing may mean an older script: try the old way
+      if (!r || !r.batch) { _batchOk = false; break; }
+      done += g.length;
+    }
+    if (_batchOk) return;
+    items = items.slice(done);
+  }
+  for (const it of items) await gasPost(it.key, it.value);
+}
 const _keyChain = {};
 // Pushes of the same key run one after another, so an older save can never land after a newer one.
 function pushToRemote(key, valueString) {
@@ -5013,9 +5035,10 @@ function pushToRemote(key, valueString) {
     try {
       if (val.length <= SYNC_CELL_LIMIT) await gasPost(key, val);
       else {
-        const parts = []; for (let i = 0; i < val.length; i += SYNC_CELL_LIMIT) parts.push(val.slice(i, i + SYNC_CELL_LIMIT));
-        for (let i = 0; i < parts.length; i++) await gasPost(key + ":" + i, parts[i]);
-        await gasPost(key, JSON.stringify({ __chunks: parts.length, t: Date.now() }));
+        const items = [];
+        for (let i = 0, n = 0; i < val.length; i += SYNC_CELL_LIMIT, n++) items.push({ key: key + ":" + n, value: val.slice(i, i + SYNC_CELL_LIMIT) });
+        items.push({ key, value: JSON.stringify({ __chunks: items.length, t: Date.now() }) }); // head last
+        await gasPostMany(items);
       }
       markDirty(key, false);
       setSyncIndicator("idle");
@@ -8082,8 +8105,9 @@ function qPushRemote(kind) {
     for (let i = 0; i < json.length; i += Q_CHUNK) parts.push(json.slice(i, i + Q_CHUNK));
     setSyncIndicator("syncing");
     try {
-      for (let i = 0; i < parts.length; i++) await qPost(key + ":" + i, parts[i]);
-      await qPost(key, JSON.stringify({ n: parts.length, t: Date.now() }));
+      const items = parts.map((p, i) => ({ key: key + ":" + i, value: p }));
+      items.push({ key, value: JSON.stringify({ n: parts.length, t: Date.now() }) }); // head last
+      await gasPostMany(items);
       markDirty(key, false);
       setSyncIndicator("idle");
     } catch (e) { console.error("Push failed for " + key, e); setSyncIndicator("error"); }
