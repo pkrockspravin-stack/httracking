@@ -4953,12 +4953,12 @@ const SAFETY_CHECKLIST = [
 const SYNC_API_URL = "https://script.google.com/macros/s/AKfycbwsmnhEPdj4wZbYaP_8AaKLAqV-TMSyrmwkQI4ImhRbWBBvfrryQy2olMt1is13G097/exec";
 const SYNC_SECRET = "ht2026"; // must exactly match the SECRET constant in your Apps Script
 
-function setSyncIndicator(status) {
+function setSyncIndicator(status, detail) {
   const el = document.getElementById("saveIndicator");
   if (!el) return;
   clearTimeout(setSyncIndicator._t);
   if (status === "syncing") { el.textContent = "syncing…"; el.style.color = "#C9A227"; el.style.opacity = "1"; }
-  else if (status === "pulling") { el.textContent = "checking for updates…"; el.style.color = "#8892A0"; el.style.opacity = "1"; }
+  else if (status === "pulling") { el.textContent = "checking for updates…" + (detail ? " " + detail : ""); el.style.color = "#8892A0"; el.style.opacity = "1"; }
   else if (status === "error") {
     el.textContent = "sync failed — saved on this device only";
     el.style.color = "#D9704F"; el.style.opacity = "1";
@@ -5056,7 +5056,7 @@ async function pullOneFromRemote(key) {
     if (!_pullPartial) return null;
   }
   const url = `${SYNC_API_URL}?key=${encodeURIComponent(key)}&secret=${encodeURIComponent(SYNC_SECRET)}`;
-  const data = await gasCall(url);
+  const data = await gasCall(url, null, 2);
   return data.value; // string, or null if the key has never been saved remotely
 }
 // Reads a key that may have been split into chunks by pushToRemote.
@@ -5103,7 +5103,13 @@ function reloadStateFromLocalStorage() {
 // Pulls every shared key from the Sheet and overwrites this device's local
 // copy with it, then re-renders. Called once quietly after page load, and
 // again whenever the person taps the manual sync button.
-async function pullAllFromRemote(showIndicator) {
+let _pullRunning = null; // a Sync already in progress is joined, not started twice
+function pullAllFromRemote(showIndicator) {
+  if (_pullRunning) { if (showIndicator) setSyncIndicator("pulling"); return _pullRunning; }
+  _pullRunning = _pullAllInner(showIndicator).finally(() => { _pullRunning = null; });
+  return _pullRunning;
+}
+async function _pullAllInner(showIndicator) {
   if (showIndicator) setSyncIndicator("pulling");
   const keys = [
     STORAGE_KEY, ENERGY_STORAGE_KEY, TWOHR_STORAGE_KEY, SHIFT_STORAGE_KEY,
@@ -5114,20 +5120,30 @@ async function pullAllFromRemote(showIndicator) {
     await flushDirty().catch(() => {});
     // One request for everything (needs the updated Apps Script); falls back to one-by-one.
     // Bulk read: only what changed since the last good sync (everything the first time).
-    let serverNow = null;
+    let serverNow = null, bulkBroken = false;
     try {
       const since = Number(localStorage.getItem(SYNC_SINCE_KEY)) || 0;
-      const merged = {}; let start = 1, pages = 0, partial = false;
+      const merged = {}; let start = 1, pages = 0, partial = false, got = 0;
+      const deadline = Date.now() + 240000; // never more than 4 minutes in total
       while (pages++ < 200) {
-        const d = await gasCall(`${SYNC_API_URL}?all=1&since=${since}&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, null, 2);
+        if (Date.now() > deadline) { bulkBroken = true; throw new Error("sync took too long"); }
+        let d;
+        try { d = await gasCall(`${SYNC_API_URL}?all=1&since=${since}&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, { timeoutMs: 45000 }, 2); }
+        catch (e) { bulkBroken = true; throw e; } // network/Google problem: stop, don't start the slow way
         if (!d || !d.values || typeof d.values !== "object") throw new Error("no bulk");
         if (pages === 1) { serverNow = typeof d.now === "number" ? d.now : null; partial = !!d.incremental && serverNow != null; }
         Object.assign(merged, d.values);
+        got += Object.keys(d.values).length;
         if (d.next == null) break;
+        if (showIndicator || pages > 1) setSyncIndicator("pulling", "(" + got + " of " + (got + (d.left || 0)) + ")");
         start = d.next;
       }
       _pullCache = merged; _pullPartial = partial;
-    } catch (e) { _pullCache = null; _pullPartial = false; serverNow = null; /* fall back to one-by-one */ }
+    } catch (e) { _pullCache = null; _pullPartial = false; serverNow = null; }
+    if (bulkBroken) { // keep everything on this phone as it is; try again on the next Sync
+      setSyncIndicator("error");
+      return;
+    }
     const has = (k) => !_pullPartial || Object.prototype.hasOwnProperty.call(_pullCache, k);
     const pullKeys = keys.filter(has); // unchanged keys are skipped
     const results = await Promise.all(pullKeys.map((k) => pullKeyFull(k).catch(() => undefined)));
