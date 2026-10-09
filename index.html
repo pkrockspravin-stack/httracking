@@ -4778,7 +4778,14 @@ function viewHome() {
   setTop({ title: 'HT Tracking', sub: 'Heat Treatment Department' });
   $app.innerHTML =
     '<input class="search" id="q" type="search" placeholder="Search any report or tracker" aria-label="Search">' +
-    '<div id="results"></div><p class="t-hint" style="text-align:center;margin-top:18px">HT Tracking ' + APP_VERSION + '</p>';
+    '<div id="results"></div><p class="t-hint" style="text-align:center;margin-top:18px">HT Tracking ' + APP_VERSION + ' · <a href="#" id="syncInfoLink">Sync info</a></p>';
+  const sil = document.getElementById('syncInfoLink');
+  if (sil) sil.onclick = (ev) => {
+    ev.preventDefault();
+    if (confirm(V14.syncInfo() + "\n\nPress OK to do a FULL re-sync now (uploads anything waiting, then downloads everything again; nothing on this phone is lost). Press Cancel to close.")) {
+      V14.fullResync().then((ok) => alert(ok ? "Full re-sync done.\n\n" + V14.syncInfo() : "Re-sync could not finish (check internet) - try again.\n\n" + V14.syncInfo()));
+    }
+  };
   const results = document.getElementById('results');
   const q = document.getElementById('q');
 
@@ -4959,6 +4966,7 @@ function setSyncIndicator(status, detail) {
   clearTimeout(setSyncIndicator._t);
   if (status === "syncing") { el.textContent = "syncing…"; el.style.color = "#C9A227"; el.style.opacity = "1"; }
   else if (status === "pulling") { el.textContent = "checking for updates…" + (detail ? " " + detail : ""); el.style.color = "#8892A0"; el.style.opacity = "1"; }
+  else if (status === "pending") { el.textContent = "synced · " + detail + " change" + (detail === 1 ? "" : "s") + " still uploading"; el.style.color = "#C9A227"; el.style.opacity = "1"; }
   else if (status === "error") {
     el.textContent = "sync failed — saved on this device only";
     el.style.color = "#D9704F"; el.style.opacity = "1";
@@ -5024,14 +5032,80 @@ async function gasPostMany(items) {
   }
   for (const it of items) await gasPost(it.key, it.value);
 }
+/* ---- Merge on save: several phones can add/edit/delete in the same section without
+   overwriting each other. For every section we remember a fingerprint of each record
+   as it was at the last sync ("base"). On save we fetch the Sheet's copy and do a
+   three-way merge: my changes + their changes; deletions on either side are respected. ---- */
+const SYNC_BASE_KEY = "ht-sync-base-v1";
+function _fp(str) { let h = 5381; for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0; return (h >>> 0).toString(36) + "." + str.length.toString(36); }
+function _recMap(val) { // -> { kind, map: Map(recordKey -> json) } or null when not mergeable
+  const map = new Map();
+  if (Array.isArray(val)) {
+    const seen = {};
+    val.forEach((r) => {
+      const j = JSON.stringify(r);
+      let k;
+      if (r && typeof r === "object" && r.id != null) k = "id:" + r.id;
+      else { const f = _fp(j); seen[f] = (seen[f] || 0) + 1; k = "h:" + f + "#" + seen[f]; }
+      if (map.has(k)) k += "~" + map.size;
+      map.set(k, j);
+    });
+    return { kind: "arr", map };
+  }
+  if (val && typeof val === "object") { Object.keys(val).forEach((k) => map.set("k:" + k, JSON.stringify(val[k]))); return { kind: "obj", map }; }
+  return null;
+}
+function _loadBase() { try { return JSON.parse(localStorage.getItem(SYNC_BASE_KEY) || "{}") || {}; } catch (e) { return {}; } }
+function setSyncBase(key, str) {
+  try {
+    const m = _recMap(JSON.parse(str)); if (!m) return;
+    const b = _loadBase(), fps = {}; m.map.forEach((j, k) => { fps[k] = _fp(j); });
+    b[key] = fps; localStorage.setItem(SYNC_BASE_KEY, JSON.stringify(b));
+  } catch (e) { /* not JSON: nothing to remember */ }
+}
+function mergeSyncValues(key, localStr, remoteStr) {
+  if (remoteStr == null || remoteStr === localStr) return localStr;
+  let L, R;
+  try { L = _recMap(JSON.parse(localStr)); R = _recMap(JSON.parse(remoteStr)); } catch (e) { return localStr; }
+  if (!L || !R || L.kind !== R.kind) return localStr;
+  const base = _loadBase()[key] || null;
+  const out = [];
+  const changedHere = (k, j) => !base || base[k] !== _fp(j);
+  L.map.forEach((lj, k) => {
+    if (R.map.has(k)) { const rj = R.map.get(k); out.push([k, changedHere(k, lj) ? lj : rj]); }
+    else if (base && base[k] !== undefined && !changedHere(k, lj)) { /* deleted on another phone */ }
+    else out.push([k, lj]); // new here (or edited here after the other phone deleted it)
+  });
+  R.map.forEach((rj, k) => {
+    if (L.map.has(k)) return;
+    if (base && base[k] !== undefined && base[k] === _fp(rj)) return; // deleted here
+    out.push([k, rj]); // new on another phone (or edited there after I deleted it)
+  });
+  if (L.kind === "arr") return "[" + out.map((x) => x[1]).join(",") + "]";
+  const o = {}; out.forEach(([k, j]) => { o[k.slice(2)] = JSON.parse(j); });
+  return JSON.stringify(o);
+}
+// Re-draw after data changed underneath, but never while someone is typing in a form.
+let _uiPending = false;
+function refreshAfterSync() {
+  reloadStateFromLocalStorage();
+  const a = document.activeElement;
+  if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) { _uiPending = true; return; }
+  _uiPending = false; renderMain();
+}
+document.addEventListener("focusout", () => { if (_uiPending) setTimeout(() => { const a = document.activeElement; if (_uiPending && !(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) { _uiPending = false; renderMain(); } }, 300); });
 const _keyChain = {};
+const _syncErr = {}; // last upload error per section, shown in Sync info
 // Pushes of the same key run one after another, so an older save can never land after a newer one.
 function pushToRemote(key, valueString) {
   markDirty(key, true);
   const run = async () => {
-    const v = localStorage.getItem(key); const val = v != null ? v : valueString; // always send the newest local copy
+    const v = localStorage.getItem(key); let val = v != null ? v : valueString; // always send the newest local copy
     setSyncIndicator("syncing");
     try {
+      const remote = await pullKeyFull(key);                 // what other phones saved
+      const merged = mergeSyncValues(key, val, remote);
+      if (merged !== val) { localStorage.setItem(key, merged); val = merged; refreshAfterSync(); }
       if (val.length <= SYNC_CELL_LIMIT) await gasPost(key, val);
       else {
         const items = [];
@@ -5039,9 +5113,10 @@ function pushToRemote(key, valueString) {
         items.push({ key, value: JSON.stringify({ __chunks: items.length, t: Date.now() }) }); // head last
         await gasPostMany(items);
       }
+      setSyncBase(key, val);
       markDirty(key, false);
       setSyncIndicator("idle");
-    } catch (e) { console.error("Push failed for " + key, e); setSyncIndicator("error"); }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); }
   };
   _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
   return _keyChain[key];
@@ -5160,18 +5235,34 @@ async function _pullAllInner(showIndicator, quietFail) {
     const results = await Promise.all(pullKeys.map((k) => pullKeyFull(k).catch(() => undefined)));
     let sawError = results.some((v) => v === undefined);
     const dirty = syncDirty();
+    let changed = false;
     pullKeys.forEach((key, i) => {
       const val = results[i];
-      if (dirty[key]) { sawError = true; return; } // local change not uploaded yet: keep it
-      if (val !== undefined && val !== null) localStorage.setItem(key, val);
+      if (dirty[key]) { // my change isn't uploaded yet: keep it, but still bring in everyone else's entries
+        if (val !== undefined && val !== null) {
+          const local = localStorage.getItem(key);
+          const merged = local == null ? val : mergeSyncValues(key, local, val);
+          if (merged !== local) { localStorage.setItem(key, merged); changed = true; }
+          setSyncBase(key, val);
+        }
+        return;
+      }
+      if (val !== undefined && val !== null) {
+        if (localStorage.getItem(key) !== val) { localStorage.setItem(key, val); changed = true; }
+        setSyncBase(key, val);
+      }
     });
-    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => (dirty[QDATA_KEYS[k]] ? Promise.resolve() : qPullRemote(k)).catch(() => { sawError = true; })));
+    const qBefore = Object.keys(QDATA_KEYS).map((k) => localStorage.getItem(QDATA_KEYS[k]));
+    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => qPullRemote(k, !!dirty[QDATA_KEYS[k]]).catch(() => { sawError = true; })));
+    if (Object.keys(QDATA_KEYS).some((k, i) => localStorage.getItem(QDATA_KEYS[k]) !== qBefore[i])) changed = true;
     _pullCache = null; _pullPartial = false;
     // Next sync asks only for changes after this one (15-second overlap for safety).
     if (!sawError && serverNow != null) localStorage.setItem(SYNC_SINCE_KEY, String(serverNow - 15000));
-    reloadStateFromLocalStorage();
-    renderMain();
-    if (!sawError || !quietFail) setSyncIndicator(sawError ? "error" : "idle");
+    if (changed) refreshAfterSync();
+    if (!sawError) localStorage.setItem("ht-sync-last-ok", String(Date.now()));
+    const waiting = Object.keys(syncDirty()).length;
+    if (!sawError && waiting) { setSyncIndicator("pending", waiting); flushDirty().then(() => { if (!Object.keys(syncDirty()).length) setSyncIndicator("idle"); }).catch(() => {}); }
+    else if (!sawError || !quietFail) setSyncIndicator(sawError ? "error" : "idle");
     return !sawError;
   } catch (e) {
     _pullCache = null; _pullPartial = false;
@@ -8129,30 +8220,43 @@ function qPushRemote(kind) {
   const key = QDATA_KEYS[kind];
   markDirty(key, true);
   const run = async () => {
-    const json = JSON.stringify(Q.data[kind]), parts = [];
+    let json = JSON.stringify(Q.data[kind]); const parts = [];
+    try {
+      const merged = mergeSyncValues(key, json, await qFetchRemote(kind)); // keep other phones' entries
+      if (merged !== json) { json = merged; Q.data[kind] = JSON.parse(merged); localStorage.setItem(key, merged); refreshAfterSync(); }
+    } catch (e) { console.error("Merge fetch failed for " + key, e); setSyncIndicator("error"); return; }
     for (let i = 0; i < json.length; i += Q_CHUNK) parts.push(json.slice(i, i + Q_CHUNK));
     setSyncIndicator("syncing");
     try {
       const items = parts.map((p, i) => ({ key: key + ":" + i, value: p }));
       items.push({ key, value: JSON.stringify({ n: parts.length, t: Date.now() }) }); // head last
       await gasPostMany(items);
+      setSyncBase(key, json);
       markDirty(key, false);
       setSyncIndicator("idle");
-    } catch (e) { console.error("Push failed for " + key, e); setSyncIndicator("error"); }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); }
   };
   _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
   return _keyChain[key];
 }
-async function qPullRemote(kind) {
+async function qFetchRemote(kind) { // the Sheet's copy of one section, or null
   const key = QDATA_KEYS[kind];
   const head = await pullOneFromRemote(key);
-  if (head === null || head === undefined) return;
+  if (head === null || head === undefined) return null;
   let n = 0;
-  try { n = JSON.parse(head).n; } catch (e) { return; }
-  if (!(n > 0)) return;
+  try { n = JSON.parse(head).n; } catch (e) { return null; }
+  if (!(n > 0)) return null;
   const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i));
   if (parts.some((p) => p == null)) throw new Error("incomplete");
-  localStorage.setItem(key, parts.join(""));
+  return parts.join("");
+}
+async function qPullRemote(kind, keepMine) {
+  const v = await qFetchRemote(kind);
+  if (v == null) return;
+  const key = QDATA_KEYS[kind], local = localStorage.getItem(key);
+  const next = keepMine && local != null ? mergeSyncValues(key, local, v) : v; // unsent change here: merge, don't drop
+  if (local !== next) localStorage.setItem(key, next);
+  setSyncBase(key, v);
 }
 
 /* ---- small helpers ---- */
@@ -12381,6 +12485,31 @@ return {
     renderMain();
   },
   sync(show) { return pullAllFromRemote(show); },
+  syncInfo() {
+    const names = {}; [[STORAGE_KEY, "Inventory"], [ENERGY_STORAGE_KEY, "Energy reading"], [TWOHR_STORAGE_KEY, "2 hourly report"], [SHIFT_STORAGE_KEY, "Shift report"],
+      [PEOPLE_KEY, "People list"], [WEEKLY_KEY, "Weekly schedule"], [AVAIL_KEY, "Manpower availability"], [ATT_KEY, "Attendance"], [LEAVE_KEY, "Leave"],
+      [SAFETY_KEY, "Safety log"], [PROD_IMPORT_KEY, "Imported production data"], [PROD_OVR_KEY, "Production edits"], [MASTER_OV_KEY, "Master data edits"]].forEach(([k, n]) => { names[k] = n; });
+    Object.keys(QDATA_KEYS).forEach((k) => { names[QDATA_KEYS[k]] = (QSPECS[k] && QSPECS[k].title) || k; });
+    const count = (k) => { try { const v = JSON.parse(localStorage.getItem(k) || "null"); return Array.isArray(v) ? v.length : v && typeof v === "object" ? Object.keys(v).length : 0; } catch (e) { return "?"; } };
+    let bytes = 0; try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); bytes += k.length + (localStorage.getItem(k) || "").length; } } catch (e) {}
+    const last = Number(localStorage.getItem("ht-sync-last-ok")) || 0;
+    const dirty = Object.keys(syncDirty());
+    return [
+      "App: " + APP_VERSION + " · sync v12",
+      "Last good sync: " + (last ? new Date(last).toLocaleString() : "never"),
+      "Waiting to upload: " + (dirty.length ? dirty.map((k) => (names[k] || k) + (_syncErr[k] ? " (" + _syncErr[k] + ")" : "")).join(", ") : "nothing"),
+      "Data on this phone: " + Math.round(bytes / 1024) + " KB",
+      "",
+      "Entries on this phone:",
+      "Energy reading: " + count(ENERGY_STORAGE_KEY) + " · Shift report: " + count(SHIFT_STORAGE_KEY) + " · 2 hourly: " + count(TWOHR_STORAGE_KEY),
+      "Inventory: " + count(STORAGE_KEY) + " · Imported production: " + count(PROD_IMPORT_KEY),
+    ].join("\n");
+  },
+  async fullResync() { // upload anything waiting, then download everything again (nothing on this phone is lost: merged)
+    await flushDirty().catch(() => {});
+    localStorage.removeItem(SYNC_SINCE_KEY);
+    return pullAllFromRemote(true);
+  },
   binQty(name) {
     const t = String(name || "").trim().toLowerCase();
     const m = MATERIAL_CATALOG.find((x) => x.name.toLowerCase() === t);
@@ -12804,6 +12933,13 @@ $tabTree.onclick = () => go('#/tree');
 window.addEventListener('hashchange', route);
 route();
 setTimeout(() => V14.sync(false), 800);
+// Keep data fresh while the app is open: every 3 minutes, and when you come back to the app.
+(function () {
+  let last = Date.now();
+  const tick = () => { if (document.visibilityState === "visible" && navigator.onLine !== false) { last = Date.now(); V14.sync(false); } };
+  setInterval(() => { if (Date.now() - last >= 180000) tick(); }, 30000);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && Date.now() - last > 60000) tick(); });
+})();
 </script>
 </body>
 </html>
