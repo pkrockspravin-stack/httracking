@@ -5063,12 +5063,12 @@ function setSyncBase(key, str) {
     b[key] = fps; localStorage.setItem(SYNC_BASE_KEY, JSON.stringify(b));
   } catch (e) { /* not JSON: nothing to remember */ }
 }
-function mergeSyncValues(key, localStr, remoteStr) {
+function mergeSyncValues(key, localStr, remoteStr, baseFps) {
   if (remoteStr == null || remoteStr === localStr) return localStr;
   let L, R;
   try { L = _recMap(JSON.parse(localStr)); R = _recMap(JSON.parse(remoteStr)); } catch (e) { return localStr; }
   if (!L || !R || L.kind !== R.kind) return localStr;
-  const base = _loadBase()[key] || null;
+  const base = baseFps !== undefined ? baseFps : (_loadBase()[key] || null);
   const out = [];
   const changedHere = (k, j) => !base || base[k] !== _fp(j);
   L.map.forEach((lj, k) => {
@@ -5094,16 +5094,49 @@ function refreshAfterSync() {
   _uiPending = false; renderMain();
 }
 document.addEventListener("focusout", () => { if (_uiPending) setTimeout(() => { const a = document.activeElement; if (_uiPending && !(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) { _uiPending = false; renderMain(); } }, 300); });
+function _fpsOf(str) { try { const m = _recMap(JSON.parse(str)); if (!m) return null; const f = {}; m.map.forEach((j, k) => { f[k] = _fp(j); }); return f; } catch (e) { return null; } }
+// Sends only MY changes (added/edited/deleted records) to the Google script, which applies them
+// to the latest data one save at a time - so two phones saving together can never overwrite each other.
+let _serverMergeOk = true;
+async function serverMergePush(key, format, getLocal, setLocal) {
+  const sent = getLocal();
+  if (sent == null) return false;
+  let L; try { L = _recMap(JSON.parse(sent)); } catch (e) { return false; }
+  if (!L) return false;
+  const base = _loadBase()[key] || null, up = [], del = [];
+  L.map.forEach((j, k) => { if (!base || base[k] !== _fp(j)) up.push([k, j]); });
+  if (base) Object.keys(base).forEach((k) => { if (!L.map.has(k)) del.push(k); });
+  if (base && !up.length && !del.length) { markDirty(key, false); return true; } // nothing new to send
+  let r;
+  try {
+    r = await gasCall(SYNC_API_URL, { method: "POST", timeoutMs: 120000, headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ secret: SYNC_SECRET, merge: { key, format, kind: L.kind, up, del } }) }, 3);
+  } catch (e) { if (/kind mismatch/.test((e && e.message) || "")) return false; throw e; }
+  if (!r || !r.merged || typeof r.value !== "string") { _serverMergeOk = false; return false; } // older Apps Script
+  const cur = getLocal();
+  let next = r.value;
+  if (cur !== sent) next = mergeSyncValues(key, cur, r.value, _fpsOf(sent)); // saved again meanwhile: keep that too
+  if (next !== cur) { setLocal(next); refreshAfterSync(); }
+  setSyncBase(key, r.value);
+  if (cur === sent) { markDirty(key, false); delete _syncErr[key]; }
+  return true;
+}
 const _keyChain = {};
 const _syncErr = {}; // last upload error per section, shown in Sync info
 // Pushes of the same key run one after another, so an older save can never land after a newer one.
 function pushToRemote(key, valueString) {
   markDirty(key, true);
   const run = async () => {
-    const v = localStorage.getItem(key); let val = v != null ? v : valueString; // always send the newest local copy
     setSyncIndicator("syncing");
     try {
-      const remote = await pullKeyFull(key);                 // what other phones saved
+      if (_serverMergeOk && await serverMergePush(key, "plain", () => { const x = localStorage.getItem(key); return x != null ? x : valueString; }, (x) => localStorage.setItem(key, x))) {
+        setSyncIndicator(Object.keys(syncDirty()).length ? "syncing" : "idle"); return;
+      }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); return; }
+    // Fallback for an older Google script: fetch, merge here, write the whole section.
+    const v = localStorage.getItem(key); let val = v != null ? v : valueString; // always send the newest local copy
+    try {
+      const remote = await pullKeyFull(key, true);           // what other phones saved (fresh from Google, never an old copy)
       const merged = mergeSyncValues(key, val, remote);
       if (merged !== val) { localStorage.setItem(key, merged); val = merged; refreshAfterSync(); }
       if (val.length <= SYNC_CELL_LIMIT) await gasPost(key, val);
@@ -5125,8 +5158,8 @@ function pushToRemote(key, valueString) {
 let _pullCache = null;      // filled by the bulk read during a sync
 let _pullPartial = false;  // true when the bulk read held only changed keys
 const SYNC_SINCE_KEY = "ht-sync-since-v2";
-async function pullOneFromRemote(key) {
-  if (_pullCache) {
+async function pullOneFromRemote(key, fresh) {
+  if (_pullCache && !fresh) {
     if (Object.prototype.hasOwnProperty.call(_pullCache, key)) return _pullCache[key];
     if (!_pullPartial) return null;
   }
@@ -5135,11 +5168,11 @@ async function pullOneFromRemote(key) {
   return data.value; // string, or null if the key has never been saved remotely
 }
 // Reads a key that may have been split into chunks by pushToRemote.
-async function pullKeyFull(key) {
-  const v = await pullOneFromRemote(key);
+async function pullKeyFull(key, fresh) {
+  const v = await pullOneFromRemote(key, fresh);
   if (typeof v === "string" && v.indexOf('{"__chunks":') === 0) {
     const n = JSON.parse(v).__chunks;
-    const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i));
+    const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i, fresh));
     if (parts.some((p) => p == null)) throw new Error("incomplete");
     return parts.join("");
   }
@@ -5178,7 +5211,8 @@ function reloadStateFromLocalStorage() {
 // Pulls every shared key from the Sheet and overwrites this device's local
 // copy with it, then re-renders. Called once quietly after page load, and
 // again whenever the person taps the manual sync button.
-let _pullRunning = null; // a Sync already in progress is joined, not started twice
+let _pullRunning = null;
+let _pullSkipped = false; // a section was saved during the sync: don't move the "since" mark // a Sync already in progress is joined, not started twice
 function pullAllFromRemote(showIndicator) {
   if (_pullRunning) { if (showIndicator) setSyncIndicator("pulling"); return _pullRunning; }
   // Google Apps Script sometimes refuses a request when busy: retry by itself (after 5 s, then 15 s)
@@ -5205,6 +5239,10 @@ async function _pullAllInner(showIndicator, quietFail) {
   try {
     await flushDirty().catch(() => {});
     // One request for everything (needs the updated Apps Script); falls back to one-by-one.
+    // What every section looked like when this sync started: anything saved on this phone
+    // while the sync runs must not be overwritten by the (older) downloaded copy.
+    const snap = {}; keys.concat(Object.keys(QDATA_KEYS).map((k) => QDATA_KEYS[k])).forEach((k) => { snap[k] = localStorage.getItem(k); });
+    _pullSkipped = false;
     // Bulk read: only what changed since the last good sync (everything the first time).
     let serverNow = null, bulkBroken = false;
     try {
@@ -5238,6 +5276,7 @@ async function _pullAllInner(showIndicator, quietFail) {
     let changed = false;
     pullKeys.forEach((key, i) => {
       const val = results[i];
+      if (localStorage.getItem(key) !== snap[key]) { _pullSkipped = true; return; } // saved here during this sync: next sync updates it
       if (dirty[key]) { // my change isn't uploaded yet: keep it, but still bring in everyone else's entries
         if (val !== undefined && val !== null) {
           const local = localStorage.getItem(key);
@@ -5253,11 +5292,11 @@ async function _pullAllInner(showIndicator, quietFail) {
       }
     });
     const qBefore = Object.keys(QDATA_KEYS).map((k) => localStorage.getItem(QDATA_KEYS[k]));
-    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => qPullRemote(k, !!dirty[QDATA_KEYS[k]]).catch(() => { sawError = true; })));
+    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => qPullRemote(k, !!dirty[QDATA_KEYS[k]], snap).catch(() => { sawError = true; })));
     if (Object.keys(QDATA_KEYS).some((k, i) => localStorage.getItem(QDATA_KEYS[k]) !== qBefore[i])) changed = true;
     _pullCache = null; _pullPartial = false;
     // Next sync asks only for changes after this one (15-second overlap for safety).
-    if (!sawError && serverNow != null) localStorage.setItem(SYNC_SINCE_KEY, String(serverNow - 15000));
+    if (!sawError && !_pullSkipped && serverNow != null) localStorage.setItem(SYNC_SINCE_KEY, String(serverNow - 15000));
     if (changed) refreshAfterSync();
     if (!sawError) localStorage.setItem("ht-sync-last-ok", String(Date.now()));
     const waiting = Object.keys(syncDirty()).length;
@@ -8220,9 +8259,16 @@ function qPushRemote(kind) {
   const key = QDATA_KEYS[kind];
   markDirty(key, true);
   const run = async () => {
+    setSyncIndicator("syncing");
+    try {
+      if (_serverMergeOk && await serverMergePush(key, "q", () => JSON.stringify(Q.data[kind]), (x) => { Q.data[kind] = JSON.parse(x); localStorage.setItem(key, x); })) {
+        setSyncIndicator(Object.keys(syncDirty()).length ? "syncing" : "idle"); return;
+      }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); return; }
+    // Fallback for an older Google script.
     let json = JSON.stringify(Q.data[kind]); const parts = [];
     try {
-      const merged = mergeSyncValues(key, json, await qFetchRemote(kind)); // keep other phones' entries
+      const merged = mergeSyncValues(key, json, await qFetchRemote(kind, true)); // keep other phones' entries (fresh copy)
       if (merged !== json) { json = merged; Q.data[kind] = JSON.parse(merged); localStorage.setItem(key, merged); refreshAfterSync(); }
     } catch (e) { console.error("Merge fetch failed for " + key, e); setSyncIndicator("error"); return; }
     for (let i = 0; i < json.length; i += Q_CHUNK) parts.push(json.slice(i, i + Q_CHUNK));
@@ -8239,21 +8285,22 @@ function qPushRemote(kind) {
   _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
   return _keyChain[key];
 }
-async function qFetchRemote(kind) { // the Sheet's copy of one section, or null
+async function qFetchRemote(kind, fresh) { // the Sheet's copy of one section, or null
   const key = QDATA_KEYS[kind];
-  const head = await pullOneFromRemote(key);
+  const head = await pullOneFromRemote(key, fresh);
   if (head === null || head === undefined) return null;
   let n = 0;
   try { n = JSON.parse(head).n; } catch (e) { return null; }
   if (!(n > 0)) return null;
-  const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i));
+  const parts = []; for (let i = 0; i < n; i++) parts.push(await pullOneFromRemote(key + ":" + i, fresh));
   if (parts.some((p) => p == null)) throw new Error("incomplete");
   return parts.join("");
 }
-async function qPullRemote(kind, keepMine) {
+async function qPullRemote(kind, keepMine, snap) {
   const v = await qFetchRemote(kind);
   if (v == null) return;
   const key = QDATA_KEYS[kind], local = localStorage.getItem(key);
+  if (snap && snap[key] !== local) { _pullSkipped = true; return; } // saved here while syncing: leave it, next sync updates it
   const next = keepMine && local != null ? mergeSyncValues(key, local, v) : v; // unsent change here: merge, don't drop
   if (local !== next) localStorage.setItem(key, next);
   setSyncBase(key, v);
@@ -12495,7 +12542,7 @@ return {
     const last = Number(localStorage.getItem("ht-sync-last-ok")) || 0;
     const dirty = Object.keys(syncDirty());
     return [
-      "App: " + APP_VERSION + " · sync v12",
+      "App: " + APP_VERSION + " · sync v14" + (_serverMergeOk ? "" : " (old Google script!)"),
       "Last good sync: " + (last ? new Date(last).toLocaleString() : "never"),
       "Waiting to upload: " + (dirty.length ? dirty.map((k) => (names[k] || k) + (_syncErr[k] ? " (" + _syncErr[k] + ")" : "")).join(", ") : "nothing"),
       "Data on this phone: " + Math.round(bytes / 1024) + " KB",
