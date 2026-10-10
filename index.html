@@ -5098,6 +5098,7 @@ function _fpsOf(str) { try { const m = _recMap(JSON.parse(str)); if (!m) return 
 // Sends only MY changes (added/edited/deleted records) to the Google script, which applies them
 // to the latest data one save at a time - so two phones saving together can never overwrite each other.
 let _serverMergeOk = true;
+let _scriptVer = null, _scriptDups = 0; // which Google script answered the last sync
 async function serverMergePush(key, format, getLocal, setLocal) {
   const sent = getLocal();
   if (sent == null) return false;
@@ -5255,7 +5256,7 @@ async function _pullAllInner(showIndicator, quietFail) {
         try { d = await gasCall(`${SYNC_API_URL}?all=1&since=${since}&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, { timeoutMs: 45000 }, 2); }
         catch (e) { bulkBroken = true; throw e; } // network/Google problem: stop, don't start the slow way
         if (!d || !d.values || typeof d.values !== "object") throw new Error("no bulk");
-        if (pages === 1) { serverNow = typeof d.now === "number" ? d.now : null; partial = !!d.incremental && serverNow != null; }
+        if (pages === 1) { serverNow = typeof d.now === "number" ? d.now : null; partial = !!d.incremental && serverNow != null; _scriptVer = d.sv || 0; _scriptDups = d.dups || 0; }
         Object.assign(merged, d.values);
         got += Object.keys(d.values).length;
         if (d.next == null) break;
@@ -12542,7 +12543,8 @@ return {
     const last = Number(localStorage.getItem("ht-sync-last-ok")) || 0;
     const dirty = Object.keys(syncDirty());
     return [
-      "App: " + APP_VERSION + " · sync v14" + (_serverMergeOk ? "" : " (old Google script!)"),
+      "App: " + APP_VERSION + " · sync v15" + (_serverMergeOk ? "" : " (old Google script!)"),
+      "Google script: " + (_scriptVer == null ? "not checked yet (tap Sync)" : _scriptVer >= 5 ? "v" + _scriptVer + " OK" : "OLD - deploy the newest script!") + (_scriptDups ? " · " + _scriptDups + " duplicate rows ignored" : ""),
       "Last good sync: " + (last ? new Date(last).toLocaleString() : "never"),
       "Waiting to upload: " + (dirty.length ? dirty.map((k) => (names[k] || k) + (_syncErr[k] ? " (" + _syncErr[k] + ")" : "")).join(", ") : "nothing"),
       "Data on this phone: " + Math.round(bytes / 1024) + " KB",
