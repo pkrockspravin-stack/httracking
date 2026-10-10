@@ -5098,7 +5098,15 @@ function _fpsOf(str) { try { const m = _recMap(JSON.parse(str)); if (!m) return 
 // Sends only MY changes (added/edited/deleted records) to the Google script, which applies them
 // to the latest data one save at a time - so two phones saving together can never overwrite each other.
 let _serverMergeOk = true;
-let _scriptVer = null, _scriptDups = 0; // which Google script answered the last sync
+let _scriptVer = null, _scriptDups = 0, _scriptSt = null; // which Google script answered the last sync
+let _lastSyncErr = null; // last problem seen (upload or download), shown in Sync info
+function noteSyncErr(where, e) { _lastSyncErr = { at: Date.now(), msg: where + ": " + ((e && e.message) || String(e)) }; }
+// After a failed upload, try again by itself a little later (no need to tap anything).
+let _retryTimer = null;
+function scheduleRetry() {
+  if (_retryTimer) return;
+  _retryTimer = setTimeout(() => { _retryTimer = null; if (Object.keys(syncDirty()).length) flushDirty().then(() => { if (!Object.keys(syncDirty()).length) setSyncIndicator("idle"); }).catch(() => {}); }, 30000);
+}
 async function serverMergePush(key, format, getLocal, setLocal) {
   const sent = getLocal();
   if (sent == null) return false;
@@ -5133,7 +5141,7 @@ function pushToRemote(key, valueString) {
       if (_serverMergeOk && await serverMergePush(key, "plain", () => { const x = localStorage.getItem(key); return x != null ? x : valueString; }, (x) => localStorage.setItem(key, x))) {
         setSyncIndicator(Object.keys(syncDirty()).length ? "syncing" : "idle"); return;
       }
-    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); return; }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); noteSyncErr("upload", e); setSyncIndicator("error"); scheduleRetry(); return; }
     // Fallback for an older Google script: fetch, merge here, write the whole section.
     const v = localStorage.getItem(key); let val = v != null ? v : valueString; // always send the newest local copy
     try {
@@ -5150,7 +5158,7 @@ function pushToRemote(key, valueString) {
       setSyncBase(key, val);
       markDirty(key, false);
       setSyncIndicator("idle");
-    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); noteSyncErr("upload", e); setSyncIndicator("error"); scheduleRetry(); }
   };
   _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
   return _keyChain[key];
@@ -5254,9 +5262,9 @@ async function _pullAllInner(showIndicator, quietFail) {
         if (Date.now() > deadline) { bulkBroken = true; throw new Error("sync took too long"); }
         let d;
         try { d = await gasCall(`${SYNC_API_URL}?all=1&since=${since}&start=${start}&secret=${encodeURIComponent(SYNC_SECRET)}`, { timeoutMs: 45000 }, 2); }
-        catch (e) { bulkBroken = true; throw e; } // network/Google problem: stop, don't start the slow way
+        catch (e) { bulkBroken = true; noteSyncErr("download", e); throw e; } // network/Google problem: stop, don't start the slow way
         if (!d || !d.values || typeof d.values !== "object") throw new Error("no bulk");
-        if (pages === 1) { serverNow = typeof d.now === "number" ? d.now : null; partial = !!d.incremental && serverNow != null; _scriptVer = d.sv || 0; _scriptDups = d.dups || 0; }
+        if (pages === 1) { serverNow = typeof d.now === "number" ? d.now : null; partial = !!d.incremental && serverNow != null; _scriptVer = d.sv || 0; _scriptDups = d.dups || 0; _scriptSt = d.st || null; }
         Object.assign(merged, d.values);
         got += Object.keys(d.values).length;
         if (d.next == null) break;
@@ -5272,6 +5280,9 @@ async function _pullAllInner(showIndicator, quietFail) {
     const has = (k) => !_pullPartial || Object.prototype.hasOwnProperty.call(_pullCache, k);
     const pullKeys = keys.filter(has); // unchanged keys are skipped
     const results = await Promise.all(pullKeys.map((k) => pullKeyFull(k).catch(() => undefined)));
+    for (let i = 0; i < pullKeys.length; i++) { // one more try for any section that failed
+      if (results[i] === undefined) results[i] = await pullKeyFull(pullKeys[i], true).catch((e) => { noteSyncErr("download " + pullKeys[i], e); return undefined; });
+    }
     let sawError = results.some((v) => v === undefined);
     const dirty = syncDirty();
     let changed = false;
@@ -5293,7 +5304,7 @@ async function _pullAllInner(showIndicator, quietFail) {
       }
     });
     const qBefore = Object.keys(QDATA_KEYS).map((k) => localStorage.getItem(QDATA_KEYS[k]));
-    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => qPullRemote(k, !!dirty[QDATA_KEYS[k]], snap).catch(() => { sawError = true; })));
+    await Promise.all(Object.keys(QSPECS).filter((k) => has(QDATA_KEYS[k])).map((k) => qPullRemote(k, !!dirty[QDATA_KEYS[k]], snap).catch((e) => { sawError = true; noteSyncErr("download " + k, e); })));
     if (Object.keys(QDATA_KEYS).some((k, i) => localStorage.getItem(QDATA_KEYS[k]) !== qBefore[i])) changed = true;
     _pullCache = null; _pullPartial = false;
     // Next sync asks only for changes after this one (15-second overlap for safety).
@@ -8265,7 +8276,7 @@ function qPushRemote(kind) {
       if (_serverMergeOk && await serverMergePush(key, "q", () => JSON.stringify(Q.data[kind]), (x) => { Q.data[kind] = JSON.parse(x); localStorage.setItem(key, x); })) {
         setSyncIndicator(Object.keys(syncDirty()).length ? "syncing" : "idle"); return;
       }
-    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); return; }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); noteSyncErr("upload", e); setSyncIndicator("error"); scheduleRetry(); return; }
     // Fallback for an older Google script.
     let json = JSON.stringify(Q.data[kind]); const parts = [];
     try {
@@ -8281,7 +8292,7 @@ function qPushRemote(kind) {
       setSyncBase(key, json);
       markDirty(key, false);
       setSyncIndicator("idle");
-    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); setSyncIndicator("error"); }
+    } catch (e) { console.error("Push failed for " + key, e); _syncErr[key] = (e && e.message) || String(e); noteSyncErr("upload", e); setSyncIndicator("error"); scheduleRetry(); }
   };
   _keyChain[key] = (_keyChain[key] || Promise.resolve()).then(run, run);
   return _keyChain[key];
@@ -12543,8 +12554,9 @@ return {
     const last = Number(localStorage.getItem("ht-sync-last-ok")) || 0;
     const dirty = Object.keys(syncDirty());
     return [
-      "App: " + APP_VERSION + " · sync v15" + (_serverMergeOk ? "" : " (old Google script!)"),
-      "Google script: " + (_scriptVer == null ? "not checked yet (tap Sync)" : _scriptVer >= 5 ? "v" + _scriptVer + " OK" : "OLD - deploy the newest script!") + (_scriptDups ? " · " + _scriptDups + " duplicate rows ignored" : ""),
+      "App: " + APP_VERSION + " · sync v16" + (_serverMergeOk ? "" : " (old Google script!)"),
+      "Google script: " + (_scriptVer == null ? "not checked yet (tap Sync)" : _scriptVer >= 6 && _scriptSt === "ok" ? "v" + _scriptVer + " OK" : _scriptVer >= 6 ? "v" + _scriptVer + " merge check: " + _scriptSt : "v" + _scriptVer + " OLD - deploy script v6!") + (_scriptDups ? " · " + _scriptDups + " duplicate rows ignored" : ""),
+      "Last sync problem: " + (_lastSyncErr ? new Date(_lastSyncErr.at).toLocaleTimeString() + " - " + _lastSyncErr.msg : "none"),
       "Last good sync: " + (last ? new Date(last).toLocaleString() : "never"),
       "Waiting to upload: " + (dirty.length ? dirty.map((k) => (names[k] || k) + (_syncErr[k] ? " (" + _syncErr[k] + ")" : "")).join(", ") : "nothing"),
       "Data on this phone: " + Math.round(bytes / 1024) + " KB",
