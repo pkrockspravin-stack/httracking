@@ -5107,6 +5107,29 @@ function scheduleRetry() {
   if (_retryTimer) return;
   _retryTimer = setTimeout(() => { _retryTimer = null; if (Object.keys(syncDirty()).length) flushDirty().then(() => { if (!Object.keys(syncDirty()).length) setSyncIndicator("idle"); }).catch(() => {}); }, 30000);
 }
+// Sends my changes to the Google script. Small uploads go as a normal link request (GET): some phones/networks
+// block Google's upload request (POST) with "Failed to fetch" while normal requests always work.
+// Bigger uploads are split into several small link requests; POST is only tried when a single record is too big.
+const MERGE_URL_MAX = 6000;
+function _mergeUrl(m) { return `${SYNC_API_URL}?secret=${encodeURIComponent(SYNC_SECRET)}&t=${Date.now()}&merge=${encodeURIComponent(JSON.stringify(m))}`; }
+async function mergeSend(m) {
+  const items = m.up.map((x) => ["u", x]).concat(m.del.map((k) => ["d", k]));
+  const batches = []; let cur = { key: m.key, format: m.format, kind: m.kind, up: [], del: [] };
+  const fits = (b) => _mergeUrl(b).length <= MERGE_URL_MAX;
+  for (const [t, x] of items) {
+    const next = { key: m.key, format: m.format, kind: m.kind, up: cur.up.concat(t === "u" ? [x] : []), del: cur.del.concat(t === "d" ? [x] : []) };
+    if (fits(next)) { cur = next; continue; }
+    if (cur.up.length || cur.del.length) batches.push(cur);
+    cur = { key: m.key, format: m.format, kind: m.kind, up: t === "u" ? [x] : [], del: t === "d" ? [x] : [] };
+    if (!fits(cur)) { // one record too big for a link: fall back to POST for everything
+      return gasCall(SYNC_API_URL, { method: "POST", timeoutMs: 120000, headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ secret: SYNC_SECRET, merge: m }) }, 3);
+    }
+  }
+  batches.push(cur); // also sent when empty: returns the latest copy
+  let r;
+  for (const b of batches) r = await gasCall(_mergeUrl(b), { timeoutMs: 60000 }, 3);
+  return r;
+}
 async function serverMergePush(key, format, getLocal, setLocal) {
   const sent = getLocal();
   if (sent == null) return false;
@@ -5117,10 +5140,8 @@ async function serverMergePush(key, format, getLocal, setLocal) {
   if (base) Object.keys(base).forEach((k) => { if (!L.map.has(k)) del.push(k); });
   if (base && !up.length && !del.length) { markDirty(key, false); return true; } // nothing new to send
   let r;
-  try {
-    r = await gasCall(SYNC_API_URL, { method: "POST", timeoutMs: 120000, headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ secret: SYNC_SECRET, merge: { key, format, kind: L.kind, up, del } }) }, 3);
-  } catch (e) { if (/kind mismatch/.test((e && e.message) || "")) return false; throw e; }
+  try { r = await mergeSend({ key, format, kind: L.kind, up, del }); }
+  catch (e) { if (/kind mismatch/.test((e && e.message) || "")) return false; throw e; }
   if (!r || !r.merged || typeof r.value !== "string") { _serverMergeOk = false; return false; } // older Apps Script
   const cur = getLocal();
   let next = r.value;
@@ -12554,8 +12575,8 @@ return {
     const last = Number(localStorage.getItem("ht-sync-last-ok")) || 0;
     const dirty = Object.keys(syncDirty());
     return [
-      "App: " + APP_VERSION + " · sync v16" + (_serverMergeOk ? "" : " (old Google script!)"),
-      "Google script: " + (_scriptVer == null ? "not checked yet (tap Sync)" : _scriptVer >= 6 && _scriptSt === "ok" ? "v" + _scriptVer + " OK" : _scriptVer >= 6 ? "v" + _scriptVer + " merge check: " + _scriptSt : "v" + _scriptVer + " OLD - deploy script v6!") + (_scriptDups ? " · " + _scriptDups + " duplicate rows ignored" : ""),
+      "App: " + APP_VERSION + " · sync v17" + (_serverMergeOk ? "" : " (old Google script!)"),
+      "Google script: " + (_scriptVer == null ? "not checked yet (tap Sync)" : _scriptVer >= 7 && _scriptSt === "ok" ? "v" + _scriptVer + " OK" : _scriptVer >= 7 ? "v" + _scriptVer + " merge check: " + _scriptSt : "v" + _scriptVer + " OLD - deploy script v7!") + (_scriptDups ? " · " + _scriptDups + " duplicate rows ignored" : ""),
       "Last sync problem: " + (_lastSyncErr ? new Date(_lastSyncErr.at).toLocaleTimeString() + " - " + _lastSyncErr.msg : "none"),
       "Last good sync: " + (last ? new Date(last).toLocaleString() : "never"),
       "Waiting to upload: " + (dirty.length ? dirty.map((k) => (names[k] || k) + (_syncErr[k] ? " (" + _syncErr[k] + ")" : "")).join(", ") : "nothing"),
